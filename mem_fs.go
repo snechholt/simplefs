@@ -4,53 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"path"
 	"sort"
 	"strings"
 	"sync"
 )
 
 type MemFS struct {
-	m map[string]*bytes.Buffer
-	l sync.RWMutex
-}
-
-func (fs *MemFS) Size() int {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	var size int
-	for _, buf := range fs.m {
-		size += buf.Cap()
-	}
-	return size
-}
-
-func (fs *MemFS) Top() (name string, b []byte) {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	var max int
-	for filename, buf := range fs.m {
-		if n := buf.Len(); n > max {
-			name, b = filename, buf.Bytes()
-			max = n
-		}
-	}
-	return name, b
-}
-
-func (fs *MemFS) Delete(name string) {
-	fs.l.Lock()
-	defer fs.l.Unlock()
-	if fs.m != nil {
-		delete(fs.m, name)
-	}
-}
-
-func (fs *MemFS) HasFile(name string) bool {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	_, ok := fs.m[name]
-	return ok
+	root *dirNode
+	l    sync.RWMutex
 }
 
 func (fs *MemFS) SetBytes(name string, b []byte) {
@@ -59,145 +20,101 @@ func (fs *MemFS) SetBytes(name string, b []byte) {
 	_ = w.Close()
 }
 
-func (fs *MemFS) TryGetBytes(name string) ([]byte, bool) {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	buf, ok := fs.m[name]
-	if ok {
-		return buf.Bytes(), true
-	}
-	return nil, false
-}
-
-func (fs *MemFS) GetBytes(name string) []byte {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	buf, ok := fs.m[name]
-	if ok {
-		return buf.Bytes()
-	}
-	return nil
-}
-
 func (fs *MemFS) SetString(name string, s string) {
 	fs.SetBytes(name, []byte(s))
 }
 
-func (fs *MemFS) GetString(name string) string {
-	fs.l.RLock()
-	defer fs.l.RUnlock()
-	buf, ok := fs.m[name]
-	if ok {
-		return string(buf.Bytes())
+func (fs *MemFS) init() {
+	fs.l.Lock()
+	if fs.root == nil {
+		fs.root = &dirNode{}
 	}
-	return ""
-}
-
-func (fs *MemFS) SetBytesMap(m map[string][]byte) {
-	for name, b := range m {
-		fs.SetBytes(name, b)
-	}
-}
-
-func (fs *MemFS) SetStringsMap(m map[string]string) {
-	for name, s := range m {
-		fs.SetString(name, s)
-	}
+	fs.l.Unlock()
 }
 
 func (fs *MemFS) Create(name string) (io.WriteCloser, error) {
+	fs.init()
 	fs.l.Lock()
 	defer fs.l.Unlock()
-	if fs.m == nil {
-		fs.m = map[string]*bytes.Buffer{}
-	}
 	var buf bytes.Buffer
-	fs.m[name] = &buf
-	// TODO: the buffer shouldn't be added to m until the consumer closes the writer
-	return &writeCloser{w: &buf}, nil
+	addNode := func() error {
+		fs.l.Lock()
+		defer fs.l.Unlock()
+		b := getBytes(&buf)
+		node := fs.root.GetOrAdd(b, nameToPath(name)...)
+		node.B = b
+		return nil
+	}
+	return &writeCloser{w: &buf, closeFn: addNode}, nil
 }
 
 func (fs *MemFS) Append(name string) (io.WriteCloser, error) {
+	fs.init()
 	fs.l.Lock()
-	buf, ok := fs.m[name]
+	got := fs.root.Get(nameToPath(name)...)
 	fs.l.Unlock()
-	if !ok {
-		// TODO: the buffer shouldn't be added to m until the consumer closes the writer
+	if got == nil {
 		return fs.Create(name)
 	}
-	return &writeCloser{w: buf}, nil
+	var buf bytes.Buffer
+	updateNode := func() error {
+		fs.l.Lock()
+		defer fs.l.Unlock()
+		b := getBytes(&buf)
+		got.B = append(got.B, b...)
+		return nil
+	}
+	return &writeCloser{w: &buf, closeFn: updateNode}, nil
 }
 
 func (fs *MemFS) Open(name string) (File, error) {
+	fs.init()
 	fs.l.RLock()
 	defer fs.l.RUnlock()
-	buf, ok := fs.m[name]
-	if ok {
-		return &memFile{name: name, buf: bytes.NewBuffer(buf.Bytes())}, nil
+	node := fs.root.Get(nameToPath(name)...)
+	if node == nil {
+		return nil, ErrNotFound
 	}
-	for filepath := range fs.m {
-		if strings.HasPrefix(filepath, name) {
-			return &memDir{fs: fs, name: name}, nil
-		}
+	if node.IsDirectory() {
+		return &memDir{fs: fs, name: name}, nil
+	} else {
+		return &memFile{name: name, buf: bytes.NewBuffer(node.B)}, nil
 	}
-	return nil, ErrNotFound
 }
 
 func (fs *MemFS) ListFiles(dir string) ([]string, error) {
+	fs.init()
 	fs.l.RLock()
 	defer fs.l.RUnlock()
 
-	if _, ok := fs.m[dir]; ok {
+	node := fs.root.Get(nameToPath(dir)...)
+
+	if node != nil && !node.IsDirectory() {
 		return nil, ErrNotFound // If dir a file, return ErrNotFound
 	}
 
 	var names []string
-	var found bool
-	for name := range fs.m {
-		if path.Dir(name) == dir {
-			names = append(names, path.Base(name))
-		} else if strings.HasPrefix(name, dir) {
-			// If the file is nested within dir, this signals that dir is an actual
-			// directory within the file system. We flag is at such, so we know not
-			// to return ErrNotFound later.
-			found = true
-		}
-	}
-
-	// If no files were found in the directory, it means that we haven't written any
-	if len(names) == 0 && !found {
-		return nil, ErrNotFound
-	}
+	node.DFS(func(node *dirNode) {
+		names = append(names, node.Path())
+	})
 
 	return names, nil
 }
 
 func (fs *MemFS) ReadDir(dir string) ([]DirEntry, error) {
+	fs.init()
 	fs.l.RLock()
 	defer fs.l.RUnlock()
 
-	if _, ok := fs.m[dir]; ok {
+	node := fs.root.Get(nameToPath(dir)...)
+
+	if node == nil || !node.IsDirectory() {
 		return nil, ErrNotFound // If dir a file, return ErrNotFound
 	}
 
-	n := len(dir)
-	m := make(map[string]*dirEntry)
-	for name := range fs.m {
-		if strings.HasPrefix(name, dir) {
-			sub := name[n+1:]
-			split := strings.SplitN(sub, "/", 2)
-			entry := &dirEntry{name: split[0], isDir: len(split) > 1}
-			m[entry.name] = entry
-		}
-	}
-
-	if len(m) == 0 {
-		return nil, ErrNotFound
-	}
-
-	entries := make([]DirEntry, 0, len(m))
-	for _, entry := range m {
-		entries = append(entries, entry)
+	entries := make([]DirEntry, len(node.Children))
+	for i, child := range node.Children {
+		entries[i] = &dirEntry{name: child.Name, isDir: child.IsDirectory()}
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
@@ -260,4 +177,135 @@ func (dir *memDir) ReadDir(n int) ([]DirEntry, error) {
 	dir.readDirEntries = dir.readDirEntries[size:]
 
 	return entries, nil
+}
+
+type dirNode struct {
+	Name     string
+	Parent   *dirNode
+	Children dirNodeSlice
+	B        []byte
+}
+
+func (node *dirNode) Level() int {
+	var level int
+	parent := node.Parent
+	for parent != nil {
+		level++
+		parent = parent.Parent
+	}
+	return level
+}
+
+func (node *dirNode) IsDirectory() bool {
+	return node.B == nil
+}
+
+func (node *dirNode) Get(path ...string) *dirNode {
+	if len(path) == 0 {
+		panic(":(")
+	}
+	var next *dirNode
+	p := path[0]
+	switch p {
+	case ".":
+		next = node
+	case "..":
+		next = node.Parent
+	default:
+		next = node.Children.Get(p)
+	}
+	if next == nil {
+		return nil
+	}
+	if len(path) > 1 {
+		return next.Get(path[1:]...)
+	}
+	return next
+}
+
+func (node *dirNode) Path() string {
+	if node.Parent == nil {
+		return node.Name
+	}
+	return node.Parent.Path() + "/" + node.Name
+}
+
+func (node *dirNode) AddDescendant(b []byte, path ...string) *dirNode {
+	childName := path[0]
+	if len(path) > 1 {
+		child := node.Children.Get(childName)
+		if child == nil {
+			child = node.AddChild(childName, nil)
+		}
+		return child.AddDescendant(b, path[1:]...)
+	}
+	child := node.Children.Get(childName)
+	if child == nil {
+		child = node.AddChild(childName, b)
+	}
+	return child
+}
+
+func (node *dirNode) AddChild(name string, b []byte) *dirNode {
+	child := &dirNode{Name: name, Parent: node, B: b}
+	node.Children = append(node.Children, child)
+	sort.Sort(node.Children)
+	return child
+}
+
+func (node *dirNode) GetOrAdd(b []byte, path ...string) *dirNode {
+	if got := node.Get(path...); got != nil {
+		return got
+	}
+	return node.AddDescendant(b, path...)
+}
+
+func (node *dirNode) DFS(fn func(node *dirNode)) {
+	fn(node)
+	for _, child := range node.Children {
+		child.DFS(fn)
+	}
+}
+
+func (node *dirNode) String() string {
+	var sb strings.Builder
+	node.DFS(func(child *dirNode) {
+		_, _ = fmt.Fprintf(&sb, "%s%s\n", strings.Repeat("\t", child.Level()), child.toString())
+	})
+	return sb.String()
+}
+
+func (node *dirNode) toString() string {
+	if node.IsDirectory() {
+		return fmt.Sprintf("dir(%s)", node.Name)
+	}
+	return fmt.Sprintf("file(%s)", node.Name)
+	// return fmt.Sprintf("{ ID:%d, Code:%s Name:%s }", node.EntityID(), node.GetCode(), node.GetName())
+}
+
+type dirNodeSlice []*dirNode
+
+func (s dirNodeSlice) Len() int           { return len(s) }
+func (s dirNodeSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s dirNodeSlice) Less(i, j int) bool { return s[i].Name < s[j].Name }
+
+func (s dirNodeSlice) Get(name string) *dirNode {
+	for _, node := range s {
+		if node.Name == name {
+			return node
+		}
+	}
+	return nil
+}
+
+func nameToPath(name string) []string {
+	return strings.Split(name, "/")
+}
+
+func getBytes(buf *bytes.Buffer) []byte {
+	b := buf.Bytes()
+	if b != nil {
+		return b
+	}
+	return make([]byte, 0)
 }

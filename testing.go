@@ -143,12 +143,12 @@ func RunFileSystemTest(fs FS) string {
 		return w.Close()
 	}
 
+	emptyFile := File{Name: "empty"}
 	t.Run("Create empty file", func() {
-		f := File{Name: "empty"}
-		if err := create(f); err != nil {
+		if err := create(emptyFile); err != nil {
 			t.Fatalf("Error creating file: %v", err)
 		}
-		assertFileContents(f)
+		assertFileContents(emptyFile)
 	})
 
 	t.Run("ReadDir", func() {
@@ -167,7 +167,8 @@ func RunFileSystemTest(fs FS) string {
 			"dir4/dir5/file",
 		}
 		for _, filename := range files {
-			f := File{Name: filename}
+			split := strings.Split(filename, "/")
+			f := File{Name: filename, Contents: []byte(split[len(split)-1])}
 			if err := create(f); err != nil {
 				t.Fatalf("Error creating file: %v", err)
 			}
@@ -175,6 +176,7 @@ func RunFileSystemTest(fs FS) string {
 		dir := func(name string) *dirEntry { return &dirEntry{name: name, isDir: true} }
 		file := func(name string) *dirEntry { return &dirEntry{name: name, isDir: false} }
 		tests := map[string][]DirEntry{
+			".":         {dir("dir1"), dir("dir2"), dir("dir4"), file(emptyFile.Name), file(file1.Name), file(file2.Name), file(file3.Name)},
 			"dir1":      {file("file1A"), file("file1B")},
 			"dir2":      {dir("dir3"), file("file2A"), file("file2B")},
 			"dir2/dir3": {file("file3A"), file("file3B")},
